@@ -8,7 +8,8 @@ Updates machine-wide TeamViewer MSI deployments with the matching signed vendor 
 Uninstalls registered LibreOffice products and the official Microsoft Store package.
 Updates registered pgAdmin 4 and supported standalone JetBrains desktop products to stable releases.
 Checks the Windows 11 build and BitLocker. Does not run Windows Update or restart Windows.
-Use -CheckOnly to report findings without installing updates, removing apps or changing Secure Boot.
+The action menu opens by default. Use the arrow keys, Space, Enter and Escape.
+Use -All for unattended remediation or -CheckOnly for an unattended, read-only report of all actions.
 Run or paste this script in an open PowerShell prompt to return to that prompt after the report.
 -NoPause is accepted for compatibility with previous versions.
 A TeamViewer update can disconnect an active remote session.
@@ -17,7 +18,8 @@ Exit codes: 0 = checks passed, 1 = failure or action required, 2 = update or reb
 [CmdletBinding()]
 param(
     [switch]$CheckOnly,
-    [switch]$NoPause
+    [switch]$NoPause,
+    [switch]$All
 )
 
 $RequiredWindowsBuild = 26100
@@ -2337,6 +2339,66 @@ function Start-SecureBoot2023 {
     }
 }
 
+function Select-RemediationActions {
+    param([object[]]$Steps)
+
+    if ($Host.Name -ne 'ConsoleHost' -or [Console]::IsInputRedirected -or [Console]::IsOutputRedirected) {
+        throw 'The action menu needs an interactive PowerShell console. Use -All for unattended remediation or -CheckOnly for a read-only report.'
+    }
+
+    $cursor = 0
+    $selected = @{}
+    $menuWidth = 0
+    $menuBottom = -1
+    $rowCount = $Steps.Count + 3
+    $requiresSelection = $false
+    while ($true) {
+        $width = [Console]::BufferWidth
+        $row = [Console]::CursorTop
+        # Redraw in place when the previous menu still fits in the console buffer.
+        if ($width -gt 56 -and $width -eq $menuWidth -and $row -eq $menuBottom -and $row -ge $rowCount) {
+            try { [Console]::SetCursorPosition(0, $row - $rowCount) }
+            catch [ArgumentOutOfRangeException] { } # The console can resize between frames.
+        }
+        Write-Host 'Security remediation | Select actions' -ForegroundColor Cyan
+        Write-Host 'Up/Down move | Space toggle | Enter run | Esc cancel'
+        for ($i = 0; $i -lt $Steps.Count; $i++) {
+            $step = $Steps[$i]
+            $pointer = if ($i -eq $cursor) { '>' } else { ' ' }
+            $mark = if ($selected.ContainsKey($step.Name)) { 'x' } else { ' ' }
+            $line = "{0} [{1}] {2}" -f $pointer, $mark, $step.Label
+            if ($i -eq $cursor) { Write-Host $line -ForegroundColor Cyan }
+            else { Write-Host $line }
+        }
+        if ($requiresSelection) {
+            Write-Host 'Select at least one action.' -ForegroundColor Yellow
+        }
+        else {
+            Write-Host (' ' * [Math]::Min(27, [Math]::Max(0, $width - 1)))
+        }
+        $menuWidth = $width
+        $menuBottom = [Console]::CursorTop
+
+        switch ([Console]::ReadKey($true).Key) {
+            'UpArrow'   { $cursor = ($cursor + $Steps.Count - 1) % $Steps.Count }
+            'DownArrow' { $cursor = ($cursor + 1) % $Steps.Count }
+            'Spacebar' {
+                $name = $Steps[$cursor].Name
+                if ($selected.ContainsKey($name)) { $selected.Remove($name) }
+                else { $selected[$name] = $true }
+                $requiresSelection = $false
+            }
+            'Enter' {
+                if ($selected.Count) {
+                    return ($Steps | Where-Object { $selected.ContainsKey($_.Name) }).Name
+                }
+                $requiresSelection = $true
+            }
+            'Escape' { return }
+        }
+    }
+}
+
 $remediationExitCode = & {
     $ErrorActionPreference = 'Stop'
     $ProgressPreference = 'SilentlyContinue'
@@ -2344,6 +2406,31 @@ $remediationExitCode = & {
     if ([Environment]::Is64BitOperatingSystem -and -not [Environment]::Is64BitProcess) {
         Write-Host 'Run this script from a 64-bit PowerShell session.' -ForegroundColor Red
         return 1
+    }
+
+    $steps = @(
+        @{ Name = '7-Zip'; Label = 'Update 7-Zip'; Action = { Update-SevenZip }; ShowVersions = $true }
+        @{ Name = 'TeamViewer'; Label = 'Update TeamViewer'; Action = { Update-TeamViewer }; ShowVersions = $true }
+        @{ Name = 'pgAdmin 4'; Label = 'Update pgAdmin 4'; Action = { Update-PgAdmin }; ShowVersions = $true }
+        @{ Name = 'JetBrains'; Label = 'Update JetBrains'; Action = { Update-JetBrains }; ShowVersions = $true }
+        @{ Name = 'LibreOffice'; Label = 'Uninstall LibreOffice'; Action = { Remove-LibreOfficeProducts } }
+        @{ Name = 'Windows'; Label = 'Check Windows build'; Action = { Test-WindowsBuild } }
+        @{ Name = 'BitLocker'; Label = 'Check BitLocker'; Action = { Test-SystemBitLocker } }
+        @{ Name = 'Secure Boot 2023'; Label = 'Service Secure Boot 2023 (includes BitLocker check)'; Action = { Start-SecureBoot2023 $bitLockerReady } }
+    )
+    try {
+        $selected = if ($All -or $CheckOnly) { $steps.Name } else { Select-RemediationActions $steps }
+    }
+    catch {
+        Write-StepMessage $_.Exception.Message 'FAILED'
+        return 1
+    }
+    if (-not $selected) {
+        Write-Host 'Cancelled.'
+        return 0
+    }
+    if ($selected -contains 'Secure Boot 2023' -and $selected -notcontains 'BitLocker') {
+        $selected = @($selected) + 'BitLocker'
     }
 
     $mutex = [Threading.Mutex]::new($false, 'Global\WorkstationSecurityRemediation')
@@ -2364,15 +2451,13 @@ $remediationExitCode = & {
         if ($CheckOnly) { Write-StepMessage 'Check-only mode.' }
         else { Write-StepMessage 'Remediation mode.' }
 
-        $results = @(Invoke-Step '7-Zip' { Update-SevenZip } -ShowVersions)
-        $results += @(Invoke-Step 'TeamViewer' { Update-TeamViewer } -ShowVersions)
-        $results += @(Invoke-Step 'pgAdmin 4' { Update-PgAdmin } -ShowVersions)
-        $results += @(Invoke-Step 'JetBrains' { Update-JetBrains } -ShowVersions)
-        $results += @(Invoke-Step 'LibreOffice' { Remove-LibreOfficeProducts })
-        $results += @(Invoke-Step 'Windows' { Test-WindowsBuild })
-        $bitLocker = Invoke-Step 'BitLocker' { Test-SystemBitLocker }
-        $results += $bitLocker
-        $results += @(Invoke-Step 'Secure Boot 2023' { Start-SecureBoot2023 ([bool]$bitLocker.ReadyForSecureBoot) })
+        $bitLockerReady = $false
+        $results = @(foreach ($step in $steps) {
+            if ($step.Name -notin $selected) { continue }
+            $result = @(Invoke-Step $step.Name $step.Action -ShowVersions:([bool]$step.ShowVersions))
+            if ($step.Name -eq 'BitLocker') { $bitLockerReady = $result.ReadyForSecureBoot -contains $true }
+            $result
+        })
 
         Write-FinalReport $results
         if ($results.Restart -contains $true) {
