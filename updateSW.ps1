@@ -983,132 +983,165 @@ function Update-TeamViewer {
     }
 }
 
-function Get-WinGetStableRelease {
-    param([string]$WinGet, [string[]]$Selection)
-
-    $catalog = Invoke-WinGet $WinGet (@('show', '--versions') + $Selection)
-    if ($catalog.Code -eq '0x00000000') {
-        $release = $catalog.Output -split '[\r\n]+' | ForEach-Object {
-            $tag = $_.Trim()
-            if ($tag -match '^\d+(?:\.\d+){1,3}$') {
-                $version = ConvertTo-AppVersion $tag
-                if ($version) { [pscustomobject]@{ Tag = $tag; Version = $version } }
-            }
-        } | Sort-Object Version -Descending | Select-Object -First 1
-        if ($release) { return $release }
-    }
-
-    $message = if ($catalog.Error) { " $($catalog.Error.Trim())" }
-    throw "WinGet could not verify a stable version ($($catalog.Code)).$message"
-}
-
 function Get-DesktopUpdateInventory {
     param([ValidateSet('pgAdmin 4', 'JetBrains')][string]$Family)
 
-    # Keep these IDs explicit so the updater only targets products from the requested families.
-    $jetBrainsPackages = [ordered]@{
-        'IntelliJ IDEA' = 'JetBrains.IntelliJIDEA'
-        'PyCharm'      = 'JetBrains.PyCharm'
-        'CLion'        = 'JetBrains.CLion'
-        'DataGrip'     = 'JetBrains.DataGrip'
-        'DataSpell'    = 'JetBrains.DataSpell'
-        'GoLand'       = 'JetBrains.GoLand'
-        'PhpStorm'     = 'JetBrains.PhpStorm'
-        'Rider'        = 'JetBrains.Rider'
-        'RubyMine'     = 'JetBrains.RubyMine'
-        'RustRover'    = 'JetBrains.RustRover'
-        'WebStorm'    = 'JetBrains.WebStorm'
-        'MPS'          = 'JetBrains.MPS'
-        'Aqua'         = 'JetBrains.Aqua'
-        'Gateway'      = 'JetBrains.Gateway'
-        'Writerside'   = 'JetBrains.Writerside'
-        'dotPeek'      = 'JetBrains.dotPeek'
-        'dotTrace'     = 'JetBrains.dotTrace'
-        'dotUltimate'  = 'JetBrains.dotUltimate'
-        'ReSharper'    = 'JetBrains.ReSharper'
+    $jetBrainsProducts = [ordered]@{
+        'IntelliJ IDEA' = @('IntelliJIDEA', 'IIU', 'idea')
+        'PyCharm'      = @('PyCharm', 'PCP', 'pycharm')
+        'CLion'        = @('CLion', 'CL', 'clion')
+        'DataGrip'     = @('DataGrip', 'DG', 'datagrip')
+        'DataSpell'    = @('DataSpell', 'DS', 'dataspell')
+        'GoLand'       = @('GoLand', 'GO', 'goland')
+        'PhpStorm'     = @('PhpStorm', 'PS', 'phpstorm')
+        'Rider'        = @('Rider', 'RD', 'rider')
+        'RubyMine'     = @('RubyMine', 'RM', 'rubymine')
+        'RustRover'    = @('RustRover', 'RR', 'rustrover')
+        'WebStorm'     = @('WebStorm', 'WS', 'webstorm')
+        'MPS'          = @('MPS', 'MPS')
+        'Aqua'         = @('Aqua', '')
+        'Gateway'      = @('Gateway', 'GW', 'gateway')
+        'Writerside'   = @('Writerside', '')
+        'dotPeek'      = @('dotPeek', 'DPK')
+        'dotTrace'     = @('dotTrace', 'DP')
+        'dotUltimate'  = @('dotUltimate', 'RSU')
+        'ReSharper'    = @('ReSharper', 'RS')
     }
 
     foreach ($record in (Get-RegisteredAppEntries)) {
         $app = $record.Entry
-        $displayName = [string]$app.DisplayName
-        $name = $null
-        $packageId = $null
+        $displayName = ([string]$app.DisplayName).Trim()
+        $version = ConvertTo-AppVersion $app.DisplayVersion
+        $scope = if ($record.Scope -eq 'Machine registry') { 'machine' } else { 'user' }
+        $otherUser = 'This installation belongs to another user. Run the update in that user context.'
         if ($Family -eq 'pgAdmin 4') {
             if ($displayName -notmatch '^pgAdmin\s+4(?:\s|$)') { continue }
-            $name = 'pgAdmin 4'
-            $packageId = 'PostgreSQL.pgAdmin'
+            if (-not $version) { $version = ConvertTo-AppVersion $displayName }
+            [pscustomobject]@{
+                Name         = 'pgAdmin 4'
+                DisplayName  = $displayName
+                PackageId    = 'PostgreSQL.pgAdmin'
+                Scope        = $scope
+                Version      = $version
+                Restriction  = if (-not $record.CurrentContext) { $otherUser }
+            }
+            continue
         }
-        elseif ($displayName -match '^JetBrains\s+Toolbox(?:\s|$)' -or
-            ($displayName -match '^Toolbox(?:\s|$)' -and $app.Publisher -match '^JetBrains\b')) {
+
+        $name = $null
+        $product = $null
+        $isToolbox = $displayName -match '^JetBrains\s+Toolbox(?:\s|$)' -or
+            ($displayName -match '^Toolbox(?:\s|$)' -and $app.Publisher -match '^JetBrains\b')
+        if ($isToolbox) {
             $name = 'JetBrains Toolbox'
-            $packageId = 'JetBrains.Toolbox'
+            $product = @('Toolbox', 'TBA', 'jetbrains-toolbox')
         }
         else {
-            foreach ($product in $jetBrainsPackages.GetEnumerator()) {
-                $pattern = '^(?:JetBrains\s+)?{0}(?:[\s(-]|$)' -f [regex]::Escape($product.Key)
+            foreach ($item in $jetBrainsProducts.GetEnumerator()) {
+                $pattern = '^(?:JetBrains\s+)?{0}(?:[\s(-]|$)' -f [regex]::Escape($item.Key)
                 if ($displayName -match $pattern) {
-                    $name = $product.Key
-                    $packageId = $product.Value
+                    $name = $item.Key
+                    $product = $item.Value
                     break
                 }
             }
-            if (-not $packageId) { continue }
+            if (-not $product) { continue }
         }
 
-        $version = $null
-        $isIde = $Family -eq 'JetBrains' -and $packageId -ne 'JetBrains.Toolbox'
-        if ($isIde) {
-            # JetBrains sometimes registers an internal build number as DisplayVersion.
-            $version = ConvertTo-AppVersion $displayName
-            if (-not $version -and $app.InstallLocation) {
-                $folder = [Environment]::ExpandEnvironmentVariables($app.InstallLocation.Trim().Trim('"'))
-                if ($folder -match '^[a-z]:\\') {
-                    $infoPath = Join-Path $folder 'product-info.json'
-                    if (Test-Path -LiteralPath $infoPath -PathType Leaf) {
-                        try {
-                            $info = Get-Content -LiteralPath $infoPath -Raw | ConvertFrom-Json
-                            $version = ConvertTo-AppVersion $info.version
-                            $displayName = "$displayName $($info.versionSuffix)".TrimEnd()
-                        }
-                        catch {
-                            Write-StepMessage "$name | Could not read product-info.json. $($_.Exception.Message)" 'WARNING'
-                        }
-                    }
-                }
-            }
-            if (-not $version) {
-                $candidate = ConvertTo-AppVersion $app.DisplayVersion
-                if ($candidate.Major -ge 2000) { $version = $candidate }
-            }
-        }
-        else {
-            $version = ConvertTo-AppVersion $app.DisplayVersion
-            if (-not $version) { $version = ConvertTo-AppVersion $displayName }
-        }
-
-        $installMetadata = "$($app.InstallLocation) $($app.UninstallString) $($app.DisplayIcon) $($app.PSChildName)"
-        $isToolboxManaged = $isIde -and (
-            $installMetadata -match '(?:\\JetBrains\\Toolbox\\|jetbrains-toolbox\.exe)' -or
-            ($record.Scope -eq 'User registry' -and $installMetadata -match '\\AppData\\Local\\Programs\\' -and
+        $launcher = if ($product.Count -gt 2) { $product[2] }
+        $toolboxManaged = -not $isToolbox -and (
+            "$($app.InstallLocation) $($app.UninstallString) $($app.DisplayIcon) $($app.PSChildName)" -match
+                '(?:\\JetBrains\\Toolbox\\|jetbrains-toolbox\.exe)' -or
+            ($scope -eq 'user' -and "$($app.InstallLocation) $($app.DisplayIcon)" -match '\\AppData\\Local\\Programs\\' -and
                 $app.UninstallString -notmatch '\\bin\\uninstall\.exe')
         )
-        $restriction = if ($displayName -match '(?:\b(?:EAP|Preview|Beta|Nightly|RC|Canary|Alpha)\d*\b|Release Candidate)') {
-            'Pre-release installation. Select the Release channel in the product updater.'
+
+        $folder = [Environment]::ExpandEnvironmentVariables(([string]$app.InstallLocation).Trim().Trim('"'))
+        $folder = $folder.Replace('/', '\').TrimEnd('\')
+        if (-not $folder -and $record.CurrentContext) {
+            foreach ($command in @($app.UninstallString, $app.DisplayIcon)) {
+                $command = [Environment]::ExpandEnvironmentVariables([string]$command)
+                if ($command -match '^\s*"?(?<Folder>[a-z]:\\[^"\r\n]*?)\\bin\\[^\\"]+?\.exe(?=["\s,]|$)') {
+                    $folder = $Matches.Folder
+                    break
+                }
+            }
         }
-        elseif ($isToolboxManaged) {
-            'This IDE is managed by JetBrains Toolbox. Use the Release channel in Toolbox.'
+
+        $executable = $null
+        $productInfoVersion = $null
+        $isPreview = $displayName -match '\b(?:EAP|Preview|Beta|Nightly|RC|Canary|Alpha)\s*\d*\b|Release Candidate'
+        if ($launcher -and $folder -match '^[a-z]:\\' -and $record.CurrentContext) {
+            try {
+                $candidates = @()
+                if (-not $isToolbox) {
+                    $infoPath = Join-Path $folder 'product-info.json'
+                    if (Test-Path -LiteralPath $infoPath -PathType Leaf) {
+                        $info = Get-Content -LiteralPath $infoPath -Raw | ConvertFrom-Json
+                        $productInfoVersion = ConvertTo-AppVersion $info.version
+                        $isPreview = $isPreview -or ([string]$info.versionSuffix -match '\b(?:EAP|Preview|Beta|Nightly|RC|Canary|Alpha)\s*\d*\b|Release Candidate')
+                        $candidates = @($info.launch | Where-Object {
+                            $_.os -eq 'Windows' -and $_.launcherPath -match '^bin[\\/][\w.-]+\.exe$'
+                        } | Select-Object -ExpandProperty launcherPath -Unique)
+                    }
+                    $candidates += @(('bin\{0}64.exe' -f $launcher), "bin\$launcher.exe")
+                }
+                else { $candidates = @("bin\$launcher.exe", "$launcher.exe") }
+                foreach ($relativePath in $candidates) {
+                    $path = Join-Path $folder $relativePath
+                    if (Test-Path -LiteralPath $path -PathType Leaf) { $executable = $path; break }
+                }
+                if ($isToolbox -and $executable) {
+                    $fileVersion = Get-ExecutableVersion $executable
+                    if ($fileVersion -and $version -and $fileVersion.Major -eq $version.Major -and
+                        $fileVersion.Minor -eq $version.Minor -and $fileVersion -gt $version) { $version = $fileVersion }
+                }
+            }
+            catch {
+                Write-StepMessage "$name | Could not read installed files in $folder. $($_.Exception.Message)" 'WARNING'
+            }
         }
-        elseif (-not $record.CurrentContext) {
-            'This installation belongs to another user. Run the update in that user context.'
+
+        if (-not $isToolbox) {
+            if ($productInfoVersion) { $version = $productInfoVersion }
+            elseif ($launcher) {
+                $displayVersion = ConvertTo-AppVersion $displayName
+                if ($displayVersion) { $version = $displayVersion }
+                elseif ($version -and $version.Major -lt 2000) { $version = $null }
+            }
+        }
+        elseif (-not $version) { $version = ConvertTo-AppVersion $displayName }
+
+        $restriction = ''
+        $management = ''
+        if ($isPreview) { $restriction = 'Pre-release installation. Select the Release channel in the product updater.' }
+        elseif (-not $record.CurrentContext) { $restriction = $otherUser }
+        elseif ($toolboxManaged) {
+            $management = 'Toolbox'
+            $restriction = 'This IDE is managed by JetBrains Toolbox. Use the Release channel and enable automatic updates in Toolbox.'
+        }
+        elseif ($app.WindowsInstaller -eq 1 -or $app.UninstallString -match '\bmsiexec(?:\.exe)?\b') {
+            $restriction = 'Managed MSI installation. Update it through its original deployment.'
+        }
+        elseif (-not $launcher) { $restriction = 'Use the original JetBrains installer or deployment for this product.' }
+        elseif ($isToolbox -and $scope -ne 'user') {
+            $restriction = 'This Toolbox App registration is machine-wide. Update it through its original deployment.'
         }
 
         [pscustomobject]@{
-            Name         = $name
-            DisplayName  = $displayName
-            PackageId    = $packageId
-            Scope        = if ($record.Scope -eq 'Machine registry') { 'machine' } else { 'user' }
-            Version      = $version
-            Restriction  = $restriction
+            Name        = $name
+            DisplayName = $displayName
+            PackageId   = "JetBrains.$($product[0])"
+            ProductCode = $product[1]
+            Launcher    = $launcher
+            IsToolbox   = $isToolbox
+            Scope       = $scope
+            Folder      = $folder
+            Executable  = $executable
+            ProductInfoVersion = $productInfoVersion
+            Version     = $version
+            Management  = $management
+            Restriction = $restriction
         }
     }
 }
@@ -1254,93 +1287,285 @@ function Update-PgAdmin {
     }
 }
 
-function Update-DesktopApps {
-    param([ValidateSet('JetBrains')][string]$Family)
+function Get-JetBrainsStableReleases {
+    param([string[]]$ProductCodes)
 
-    Write-StepMessage "$Family | Looking for registered installations."
-    $inventory = @(Get-DesktopUpdateInventory $Family)
+    $codes = [uri]::EscapeDataString(($ProductCodes -join ','))
+    $api = "https://data.services.jetbrains.com/products/releases?code=$codes&latest=true&type=release"
+    $catalog = Invoke-RestMethod -Uri $api -UseBasicParsing -TimeoutSec 30
+    $releases = @{}
+    foreach ($productCode in $ProductCodes) {
+        $entry = $catalog.PSObject.Properties[$productCode]
+        if (-not $entry) { continue }
+        foreach ($release in $entry.Value) {
+            $tag = [string]$release.version
+            if ($release.type -ne 'release' -or $tag -notmatch '^\d+(?:\.\d+){1,3}$') { continue }
+            $target = ConvertTo-AppVersion $tag
+            if (-not $target) { continue }
+            if ($productCode -eq 'TBA' -and $release.build -match '^\d+(?:\.\d+){2,3}$') {
+                $build = ConvertTo-AppVersion $release.build
+                if ($build -ge $target -and $build.Major -eq $target.Major -and $build.Minor -eq $target.Minor) {
+                    $target = $build
+                }
+            }
+            if (-not $releases.ContainsKey($productCode) -or $target -gt $releases[$productCode].Version) {
+                $releases[$productCode] = [pscustomobject]@{ Tag = $tag; Version = $target; Downloads = $release.downloads }
+            }
+        }
+    }
+    return $releases
+}
+
+function Save-JetBrainsInstaller {
+    param($Download, [string]$TargetPath)
+
+    foreach ($address in @($Download.link, $Download.checksumLink)) {
+        $url = $null
+        if (-not [uri]::TryCreate([string]$address, [UriKind]::Absolute, [ref]$url) -or
+            $url.Scheme -ne 'https' -or $url.Host -notin @('download.jetbrains.com', 'download-cdn.jetbrains.com') -or
+            -not $url.IsDefaultPort -or $url.UserInfo) {
+            throw 'JetBrains did not return an approved HTTPS installer or checksum URL.'
+        }
+    }
+    $installerUri = [uri]$Download.link
+    if ($installerUri.AbsolutePath -notmatch '\.exe$' -or "$($Download.link).sha256" -ne $Download.checksumLink) {
+        throw 'The JetBrains release does not provide a matching Windows EXE and SHA-256 checksum.'
+    }
+
+    $checksum = Invoke-WebRequest -Uri $Download.checksumLink -UseBasicParsing -TimeoutSec 30
+    $checksumText = if ($checksum.Content -is [byte[]]) {
+        [Text.Encoding]::ASCII.GetString($checksum.Content)
+    } else { [string]$checksum.Content }
+    if ($checksumText.Trim() -notmatch '^(?<Hash>[0-9a-f]{64})(?:[ \t]+\*?[^\r\n]+)?$') {
+        throw 'Could not read the publisher SHA-256 checksum.'
+    }
+    $expectedHash = $Matches.Hash
+    Invoke-WebRequest -Uri $installerUri -OutFile $TargetPath -UseBasicParsing -TimeoutSec 1200
+    if ($Download.size -gt 0 -and (Get-Item -LiteralPath $TargetPath).Length -ne $Download.size) {
+        throw 'The downloaded JetBrains installer is incomplete or has an unexpected size.'
+    }
+    if ((Get-FileHash -LiteralPath $TargetPath -Algorithm SHA256).Hash -ne $expectedHash) {
+        throw 'The JetBrains installer SHA-256 checksum did not match.'
+    }
+    $signature = Get-AuthenticodeSignature -LiteralPath $TargetPath
+    $publisher = if ($signature.SignerCertificate) {
+        $signature.SignerCertificate.GetNameInfo([Security.Cryptography.X509Certificates.X509NameType]::SimpleName, $false)
+    }
+    if ($signature.Status -ne 'Valid' -or $publisher -ne 'JetBrains s.r.o.') {
+        throw "Unexpected installer signature. Status: $($signature.Status). Signer: $publisher."
+    }
+}
+
+function Update-JetBrains {
+    Write-StepMessage 'JetBrains | Looking for installed products, installation scope and management channel.'
+    $inventory = @(Get-DesktopUpdateInventory 'JetBrains')
     if (-not $inventory) {
-        New-Result $Family 'SKIPPED' 'No supported registered installations found.' -InstalledVersion 'Not installed' -LatestStableVersion 'Not checked'
+        New-Result 'JetBrains' 'SKIPPED' 'No supported registered products found.' -InstalledVersion 'Not installed' -LatestStableVersion 'Not checked'
         return
     }
 
-    $winget = (Get-Command winget.exe -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1).Source
-    $selectionOptions = @('--exact', '--source', 'winget', '--disable-interactivity', '--accept-source-agreements')
-    $catalogCache = @{}
-    $groups = $inventory | Group-Object PackageId, Scope, Restriction
+    $catalog = @{}
+    $catalogError = $null
+    $codes = @($inventory | Where-Object ProductCode | Select-Object -ExpandProperty ProductCode -Unique)
+    if ($codes) {
+        Write-StepMessage 'JetBrains | Checking the publisher for stable Windows releases.'
+        try { $catalog = Get-JetBrainsStableReleases $codes }
+        catch { $catalogError = $_.Exception.Message }
+    }
+
+    # Group on a single non-null string for Windows PowerShell 5.1.
+    $groups = $inventory | Group-Object { '{0}|{1}|{2}' -f $_.PackageId, $_.Scope, $_.Restriction }
+    $installerRunning = $false
     foreach ($group in $groups) {
-        $app = $group.Group[0]
-        $versionList = @($group.Group.Version | Where-Object { $_ } | Sort-Object -Unique)
+        $apps = @($group.Group)
+        $app = $apps[0]
+        $name = $app.Name
+        $latest = $catalog[$app.ProductCode]
+        $installed = @($apps.Version | Where-Object { $_ } | Sort-Object -Unique)
         $versions = @{
-            InstalledVersion    = if ($versionList) { $versionList -join ', ' } else { 'Unknown' }
-            LatestStableVersion = 'Unavailable'
+            InstalledVersion = if ($installed) { $installed -join ', ' } else { 'Unknown' }
+            LatestStableVersion = if ($latest) { $latest.Tag } else { 'Unavailable' }
         }
-        $selection = @('--id', $app.PackageId) + $selectionOptions
+        $workPath = $null
+        $keepFiles = $false
+        $logPath = $null
         try {
-            if ($winget) {
-                if (-not $catalogCache.ContainsKey($app.PackageId)) {
-                    Write-StepMessage "$($app.Name) | Checking the WinGet catalog for the latest stable release."
-                    try {
-                        $catalogCache[$app.PackageId] = Get-WinGetStableRelease $winget $selection
-                    }
-                    catch {
-                        if (-not $app.Restriction) { throw }
-                        Write-StepMessage "$($app.Name) | $($_.Exception.Message)" 'WARNING'
-                    }
-                }
-                $latest = $catalogCache[$app.PackageId]
-                if ($latest) { $versions.LatestStableVersion = $latest.Tag }
-            }
-
+            Write-StepMessage "$name | Installed version $($versions.InstalledVersion). Latest stable version $($versions.LatestStableVersion) ($($app.Scope) scope)."
             if ($app.Restriction) {
-                New-Result $app.Name 'ACTION REQUIRED' $app.Restriction @versions
+                if ($app.Management -eq 'Toolbox' -and $latest -and $installed -and
+                    $installed[0] -ge $latest.Version -and -not ($apps | Where-Object { -not $_.Version -or -not $_.Executable })) {
+                    New-Result $name 'UP TO DATE' 'All detected Toolbox-managed copies meet the latest stable version.' @versions
+                }
+                else {
+                    $reason = $app.Restriction
+                    if ($catalogError) { $reason += " Stable release lookup failed. $catalogError" }
+                    New-Result $name 'ACTION REQUIRED' $reason @versions
+                }
                 continue
             }
-            if (-not $winget) { throw 'WinGet is unavailable for the current account.' }
+            if ($catalogError) { throw "Publisher release lookup failed. $catalogError" }
+            if (-not $latest) { throw 'The publisher did not return a stable release for this product.' }
 
-            Write-StepMessage "$($app.Name) | Installed version $($versions.InstalledVersion). Latest stable version $($latest.Tag)."
-            if ($group.Group | Where-Object { -not $_.Version }) {
-                New-Result $app.Name 'ACTION REQUIRED' 'Could not verify the installed version for every registered copy.' @versions
+            $current = @($apps | Where-Object { $_.Executable -and $_.Version -ge $latest.Version })
+            $needsAttention = @($apps | Where-Object {
+                -not $_.Version -or -not $_.Executable -or $_.Version -lt $latest.Version
+            })
+            if ($current) {
+                if ($needsAttention) {
+                    New-Result $name 'ACTION REQUIRED' "The stable release is present. Older or unverified copies remain ($($app.Scope) scope)." @versions
+                }
+                else {
+                    New-Result $name 'UP TO DATE' "All detected copies meet the latest stable version ($($app.Scope) scope)." @versions
+                }
                 continue
             }
-            if ($versionList[0] -ge $latest.Version) {
-                New-Result $app.Name 'UP TO DATE' 'All detected copies meet the latest stable version.' @versions
+
+            $source = $apps | Where-Object { $_.Executable -and $_.Version -and $_.Version -lt $latest.Version } |
+                Sort-Object Version -Descending | Select-Object -First 1
+            if (-not $source) {
+                New-Result $name 'ACTION REQUIRED' 'Could not verify an installed launcher and version. Review the registered installation.' @versions
                 continue
             }
             if ($CheckOnly) {
-                New-Result $app.Name 'ACTION REQUIRED' "Stable update available for the $($app.Scope) installation. Check-only mode." @versions
+                New-Result $name 'ACTION REQUIRED' "Stable update available for the $($app.Scope) installation. Check-only mode." @versions
+                continue
+            }
+            if ($installerRunning -or (Get-Process -Name 'jetbrains-remediation-*' -ErrorAction SilentlyContinue)) {
+                New-Result $name 'PENDING' 'Update deferred while a JetBrains installer is still running.' @versions
                 continue
             }
 
-            Write-StepMessage "$($app.Name) | Installing stable release $($latest.Tag) via WinGet ($($app.Scope) scope)."
-            $arguments = @('upgrade') + $selection + @('--scope', $app.Scope, '--version', $latest.Tag, '--silent', '--accept-package-agreements')
-            $update = Invoke-WinGet $winget $arguments
-            Write-StepMessage "$($app.Name) | WinGet returned $($update.Code). Checking the installed versions again."
+            $processNames = @($app.Launcher, ('{0}64' -f $app.Launcher))
+            $processNames += @($apps.Executable | Where-Object { $_ } | ForEach-Object {
+                [regex]::Match($_, '[^\\/]+(?=\.exe$)', 'IgnoreCase').Value
+            } | Where-Object { $_ } | Select-Object -Unique)
+            if (Get-Process -Name $processNames -ErrorAction SilentlyContinue) {
+                New-Result $name 'ACTION REQUIRED' "Close $name in all sessions and rerun the update." @versions
+                continue
+            }
 
-            $after = @(Get-DesktopUpdateInventory $Family | Where-Object {
-                $_.PackageId -eq $app.PackageId -and $_.Scope -eq $app.Scope -and -not $_.Restriction
-            })
-            $afterVersions = @($after.Version | Where-Object { $_ } | Sort-Object -Unique)
+            $launcherArchitecture = Get-PeArchitecture $source.Executable
+            if ($launcherArchitecture -eq 'x86' -and -not $app.IsToolbox) {
+                New-Result $name 'ACTION REQUIRED' 'A legacy 32-bit IDE was detected. Use the original deployment to migrate it.' @versions
+                continue
+            }
+            # The IDE installer checks the native processor even when the old launcher runs under emulation.
+            $processor = Get-CimInstance -ClassName Win32_Processor -Property Architecture -OperationTimeoutSec 15 |
+                Select-Object -First 1
+            $architecture = switch ($processor.Architecture) {
+                9  { 'x64' }
+                12 { 'arm64' }
+            }
+            if (-not $architecture) { throw 'Could not verify the native Windows processor architecture.' }
+            if (-not $app.IsToolbox -and $launcherArchitecture -ne $architecture) {
+                New-Result $name 'ACTION REQUIRED' "The installed IDE uses $launcherArchitecture on $architecture. Use the original deployment to migrate it." @versions
+                continue
+            }
+            $download = switch ($architecture) {
+                'x64' { $latest.Downloads.windows }
+                'arm64' { $latest.Downloads.windowsARM64 }
+            }
+            if (-not $download) {
+                New-Result $name 'ACTION REQUIRED' "The publisher offers no supported $architecture installer." @versions
+                continue
+            }
+
+            $destination = $null
+            if (-not $app.IsToolbox) {
+                $base = if ($app.Scope -eq 'machine') { $env:ProgramFiles } else { Join-Path $env:LOCALAPPDATA 'Programs' }
+                $destination = (Join-Path $base ("JetBrains\{0} {1}" -f $name, $latest.Tag)).Replace('/', '\')
+                if (Test-Path -LiteralPath $destination) {
+                    New-Result $name 'ACTION REQUIRED' "Target folder already exists. Review it before retrying. Folder: $destination" @versions
+                    continue
+                }
+            }
+
+            $runId = [guid]::NewGuid().ToString('N')
+            $workPath = Join-Path ([IO.Path]::GetTempPath()) "jetbrains-remediation-$runId"
+            New-Item -Path $workPath -ItemType Directory | Out-Null
+            $installerPath = Join-Path $workPath "jetbrains-remediation-$runId.exe"
+            Write-StepMessage "$name | Downloading stable release $($latest.Tag) ($architecture) and verifying its SHA-256 and JetBrains signature."
+            Save-JetBrainsInstaller $download $installerPath
+            if (Get-Process -Name $processNames -ErrorAction SilentlyContinue) {
+                New-Result $name 'ACTION REQUIRED' "$name opened during the download. Close it and rerun the update." @versions
+                continue
+            }
+
+            $arguments = '/headless'
+            if ($destination) {
+                $logPath = "$workPath.log"
+                $config = Join-Path $workPath 'silent.config'
+                $mode = if ($app.Scope -eq 'machine') { 'admin' } else { 'user' }
+                Set-Content -LiteralPath $config -Value "mode=$mode" -Encoding Ascii
+                if (Test-Path -LiteralPath $destination) {
+                    New-Result $name 'ACTION REQUIRED' "Target folder appeared during the download. Review it before retrying. Folder: $destination" @versions
+                    continue
+                }
+                # NSIS requires the unquoted /D= path to be last, including paths with spaces.
+                $arguments = '/S /CONFIG="{0}" /LOG="{1}" /D={2}' -f $config, $logPath, $destination
+            }
+            $logDetails = if ($logPath) { " Installer log: $logPath" } else { '' }
+            Write-StepMessage "$name | Installing $($latest.Tag) silently ($($app.Scope) scope)."
+            $process = Start-Process -FilePath $installerPath -ArgumentList $arguments -WindowStyle Hidden -PassThru
+            $installerRunning = $true
+            $keepFiles = $true
+            try {
+                for ($elapsed = 30; $elapsed -le 1200; $elapsed += 30) {
+                    if ($process.WaitForExit(30000)) {
+                        $exitCode = $process.ExitCode
+                        $installerRunning = $false
+                        $keepFiles = $false
+                        break
+                    }
+                    Write-StepMessage "$name | Waiting for installer PID $($process.Id) ($elapsed seconds)."
+                }
+                if ($keepFiles) {
+                    New-Result $name 'PENDING' "Installer PID $($process.Id) is still running after 20 minutes. Recheck after it finishes.$logDetails" @versions
+                    continue
+                }
+            }
+            finally { $process.Dispose() }
+
+            Write-StepMessage "$name | Installer returned exit code $exitCode. Verifying the installed version."
+            if ($exitCode -in @(1641, 3010)) {
+                New-Result $name 'PENDING' "Installer returned exit code $exitCode. Recheck after restart.$logDetails" @versions -Restart
+                continue
+            }
+            if ($exitCode -ne 0) { throw "Installer returned exit code $exitCode.$logDetails" }
+
             $previous = $versions.InstalledVersion
-            $versions.InstalledVersion = if ($afterVersions) { $afterVersions -join ', ' } else { 'Unknown' }
-
-            if ($update.Code -in @('0x8A150109', '0x8A15010A', '0x8A15010B')) {
-                New-Result $app.Name 'PENDING' "WinGet returned $($update.Code). Recheck after restart." @versions -Restart
+            for ($attempt = 1; $attempt -le 6; $attempt++) {
+                $after = @(Get-DesktopUpdateInventory 'JetBrains' | Where-Object {
+                    $_.PackageId -eq $app.PackageId -and $_.Scope -eq $app.Scope -and -not $_.Restriction
+                })
+                $verified = @($after | Where-Object {
+                    $_.Executable -and (
+                        ($app.IsToolbox -and $_.Version -ge $latest.Version) -or
+                        ($destination -and $_.Folder -eq $destination -and $_.ProductInfoVersion -ge $latest.Version)
+                    )
+                })
+                if ($verified) { break }
+                if ($attempt -lt 6) { Start-Sleep -Seconds 5 }
             }
-            elseif ($update.Code -in @('0x00000000', '0x8A15002B') -and $afterVersions -and
-                $afterVersions[0] -ge $latest.Version -and -not ($after | Where-Object { -not $_.Version })) {
-                New-Result $app.Name 'UPDATED' "Stable version verified in the $($app.Scope) scope." @versions -PreviousVersion $previous
+            $afterVersions = @($after.Version | Where-Object { $_ } | Sort-Object -Unique)
+            if ($afterVersions) { $versions.InstalledVersion = $afterVersions -join ', ' }
+            if (-not $verified) {
+                throw "The installer finished, but the expected registry entry, launcher and version could not be verified.$logDetails"
             }
-            elseif ($afterVersions -and $afterVersions[-1] -ge $latest.Version -and $afterVersions[0] -lt $latest.Version) {
-                New-Result $app.Name 'ACTION REQUIRED' "The stable release is present, but an older version is still registered ($($update.Code))." @versions
+            if ($after | Where-Object { -not $_.Executable -or -not $_.Version -or $_.Version -lt $latest.Version }) {
+                New-Result $name 'ACTION REQUIRED' "The stable release was installed and verified. Older or unverified copies remain.$logDetails" @versions -PreviousVersion $previous
+                continue
             }
-            else {
-                $message = if ($update.Error) { " $($update.Error.Trim())" }
-                throw "The stable upgrade could not be verified ($($update.Code)).$message"
-            }
+            if ($logPath) { Remove-Item -LiteralPath $logPath -Force -ErrorAction SilentlyContinue }
+            New-Result $name 'UPDATED' "Stable version verified in the $($app.Scope) scope." @versions -PreviousVersion $previous
         }
         catch {
-            New-Result $app.Name 'FAILED' $_.Exception.Message @versions
+            New-Result $name 'FAILED' $_.Exception.Message @versions
+        }
+        finally {
+            if ($workPath -and -not $keepFiles) {
+                Remove-Item -LiteralPath $workPath -Recurse -Force -ErrorAction SilentlyContinue
+            }
         }
     }
 }
@@ -1769,7 +1994,7 @@ $remediationExitCode = & {
         $results = @(Invoke-Step '7-Zip' { Update-SevenZip } -ShowVersions)
         $results += @(Invoke-Step 'TeamViewer' { Update-TeamViewer } -ShowVersions)
         $results += @(Invoke-Step 'pgAdmin 4' { Update-PgAdmin } -ShowVersions)
-        $results += @(Invoke-Step 'JetBrains' { Update-DesktopApps 'JetBrains' } -ShowVersions)
+        $results += @(Invoke-Step 'JetBrains' { Update-JetBrains } -ShowVersions)
         $results += @(Invoke-Step 'LibreOffice' { Remove-LibreOfficeProducts })
         $results += @(Invoke-Step 'Windows' { Test-WindowsBuild })
         $bitLocker = Invoke-Step 'BitLocker' { Test-SystemBitLocker }
