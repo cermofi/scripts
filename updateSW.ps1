@@ -173,7 +173,7 @@ function Get-SevenZipRegisteredDirectory {
     param($App)
 
     $directory = [Environment]::ExpandEnvironmentVariables(([string]$App.InstallLocation).Trim().Trim('"')).TrimEnd('\')
-    if ($directory -match '^[a-z]:\\') { $directory }
+    if ($directory -match '^[a-z]:\\[^"<>:|?*\r\n]+$') { $directory }
 
     foreach ($value in @($App.DisplayIcon, $App.QuietUninstallString, $App.UninstallString)) {
         $command = [Environment]::ExpandEnvironmentVariables([string]$value)
@@ -181,6 +181,15 @@ function Get-SevenZipRegisteredDirectory {
             $Matches.Folder
         }
     }
+}
+
+function Get-SevenZipRegisteredArchitecture {
+    param($Entry)
+
+    if ($Entry.DisplayName -match '\b(?:arm64|aarch64)\b') { return 'arm64' }
+    if ($Entry.DisplayName -match '\b(?:x64|amd64)\b') { return 'x64' }
+    if ($Entry.DisplayName -match '\b(?:x86|32[- ]bit)\b' -or $Entry.PSPath -match '\\WOW6432Node\\' -or
+        -not [Environment]::Is64BitOperatingSystem) { return 'x86' }
 }
 
 function Get-SevenZipInstallations {
@@ -210,20 +219,33 @@ function Get-SevenZipInstallations {
                 Get-SevenZipRegisteredDirectory ([pscustomobject]@{ DisplayIcon = $entry.'(default)' })
             }
         }
+        foreach ($root in @('HKLM:\SOFTWARE\Classes', 'HKLM:\SOFTWARE\Classes\WOW6432Node')) {
+            $key = "$root\CLSID\{23170F69-40C1-278A-1000-000100020000}\InprocServer32"
+            if (Test-Path -LiteralPath $key) {
+                $path = [Environment]::ExpandEnvironmentVariables([string](Get-ItemProperty -LiteralPath $key).'(default)')
+                if ($path.Trim('"') -match '^(?<Directory>[a-z]:\\[^"<>:|?*\r\n]+)\\7-zip(?:32)?\.dll$') {
+                    $Matches.Directory
+                }
+            }
+        }
     )
 
     $uniqueDirectories = $directories | Where-Object { $_ } | ForEach-Object {
         [Environment]::ExpandEnvironmentVariables(([string]$_).Trim().Trim('"')).TrimEnd('\')
     } | Where-Object { $_ -match '^[a-z]:\\' } | Sort-Object -Unique
     foreach ($directory in $uniqueDirectories) {
-        foreach ($component in @('7z.exe', '7zFM.exe', '7zG.exe')) {
+        foreach ($component in @('7z.exe', '7zFM.exe', '7zG.exe', '7z.dll', '7-zip.dll')) {
             $file = Join-Path $directory $component
             if (-not (Test-Path -LiteralPath $file -PathType Leaf)) { continue }
             $item = Get-Item -LiteralPath $file
-            $architecture = Get-PeArchitecture $item.FullName
+            try { $architecture = Get-PeArchitecture $item.FullName }
+            catch {
+                Write-StepMessage "7-Zip | Could not identify architecture of $file. $($_.Exception.Message)" 'WARNING'
+                continue
+            }
             [pscustomobject]@{
                 File         = $item.FullName
-                Directory    = $item.DirectoryName
+                Directory    = $directory
                 Architecture = $architecture
             }
             break
@@ -256,38 +278,237 @@ function Test-PendingFileReplacement {
     return $false
 }
 
+function Get-SevenZipMsiRegistration {
+    param($Entry)
+
+    $guidPattern = '\{[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}\}'
+    $code = [string]$Entry.PSChildName
+    if ($code -notmatch "^$guidPattern$") {
+        $command = [string]$Entry.UninstallString
+        if ($command -notmatch "\bmsiexec(?:\.exe)?\b.*?\s/[ix]\s*$guidPattern") {
+            throw 'Windows Installer product code is missing.'
+        }
+        $code = [regex]::Match($Matches[0], $guidPattern, 'IgnoreCase').Value
+    }
+    $installer = New-Object -ComObject WindowsInstaller.Installer
+    $database = $null
+    $summary = $null
+    try {
+        $type = $installer.GetType()
+        $state = $type.InvokeMember('ProductState', 'GetProperty', $null, $installer, @($code))
+        if ($state -ne 5) { throw "Windows Installer reports state $state for $code." }
+        $localPackage = $type.InvokeMember('ProductInfo', 'GetProperty', $null, $installer, @($code, 'LocalPackage'))
+        if (-not $localPackage -or -not (Test-Path -LiteralPath $localPackage -PathType Leaf)) {
+            throw "The cached MSI for $code is unavailable."
+        }
+
+        $database = $installer.OpenDatabase($localPackage, 0)
+        $properties = Get-SevenZipMsiProperties $database
+        if ($properties.ProductCode -ne $code -or -not $properties.UpgradeCode) {
+            throw 'The cached MSI identity could not be verified.'
+        }
+        $summary = $type.InvokeMember('SummaryInformation', 'GetProperty', $null, $installer, @($localPackage, 0))
+        $template = [string]$summary.GetType().InvokeMember('Property', 'GetProperty', $null, $summary, @(7))
+        $architecture = switch (($template -split ';')[0]) {
+            'Intel' { 'x86' }
+            'x64'   { 'x64' }
+            'Arm64' { 'arm64' }
+        }
+        if (-not $architecture) { throw "Unrecognized MSI architecture: $template" }
+
+        $version = ConvertTo-AppVersion ($type.InvokeMember('ProductInfo', 'GetProperty', $null, $installer, @($code, 'VersionString')))
+        $language = $type.InvokeMember('ProductInfo', 'GetProperty', $null, $installer, @($code, 'Language'))
+        if (-not $version) { throw 'The installed MSI version could not be verified.' }
+        $directory = $null
+        try { $directory = $type.InvokeMember('ProductInfo', 'GetProperty', $null, $installer, @($code, 'InstallLocation')) }
+        catch { Write-StepMessage "7-Zip | MSI $code does not expose InstallLocation. Checking component paths." 'WARNING' }
+        if (-not $directory) {
+            $quote = [char]96
+            $fileSql = 'SELECT {0}File{0}, {0}FileName{0} FROM {0}File{0}' -f $quote
+            $componentSql = 'SELECT {0}ComponentId{0}, {0}KeyPath{0} FROM {0}Component{0}' -f $quote
+            $fileKeys = foreach ($row in (Get-MsiRows $database $fileSql 2)) {
+                if (($row[1] -split '\|')[-1] -in @('7z.exe', '7zFM.exe', '7z.dll')) { $row[0] }
+            }
+            foreach ($row in (Get-MsiRows $database $componentSql 2)) {
+                if (-not $row[0] -or $fileKeys -notcontains $row[1]) { continue }
+                try { $path = $type.InvokeMember('ComponentPath', 'GetProperty', $null, $installer, @($code, $row[0])) }
+                catch { continue }
+                if ($path -match '^(?<Directory>[a-z]:\\[^"<>:|?*\r\n]+)\\(?:7z(?:FM)?\.exe|7z\.dll)$') {
+                    $directory = $Matches.Directory
+                    break
+                }
+            }
+        }
+        [pscustomobject]@{
+            ProductCode = $code
+            UpgradeCode = $properties.UpgradeCode
+            Architecture = $architecture
+            Directory = Get-SevenZipRegisteredDirectory ([pscustomobject]@{ InstallLocation = $directory }) | Select-Object -First 1
+            Version = $version
+            Language = $language
+        }
+    }
+    finally {
+        foreach ($com in @($summary, $database, $installer)) {
+            if ($com) { [void][Runtime.InteropServices.Marshal]::ReleaseComObject($com) }
+        }
+    }
+}
+
+function Get-SevenZipMsiProperties {
+    param($Database)
+
+    $quote = [char]96
+    $query = 'SELECT {0}Property{0}, {0}Value{0} FROM {0}Property{0}' -f $quote
+    $properties = @{}
+    foreach ($row in (Get-MsiRows $Database $query 2)) { $properties[$row[0]] = $row[1] }
+    if ($properties.ProductName -notmatch '^7-Zip(?:\s|$)' -or $properties.Manufacturer -ne 'Igor Pavlov') {
+        throw "Unexpected 7-Zip MSI identity: $($properties.ProductName), $($properties.Manufacturer)."
+    }
+    return $properties
+}
+
+function Get-SevenZipMsiTargetCode {
+    param([string]$Path, $Source, [version]$Latest)
+
+    $installer = New-Object -ComObject WindowsInstaller.Installer
+    $database = $null
+    try {
+        $database = $installer.OpenDatabase($Path, 0)
+        $properties = Get-SevenZipMsiProperties $database
+        if (-not $properties.ProductCode -or (ConvertTo-AppVersion $properties.ProductVersion) -ne $Latest) {
+            throw 'The new MSI product code or version does not match the release.'
+        }
+        if ($properties.ProductCode -eq $Source.ProductCode) { return $properties.ProductCode }
+
+        $quote = [char]96
+        $sequenceSql = 'SELECT {0}Action{0} FROM {0}InstallExecuteSequence{0}' -f $quote
+        $actions = Get-MsiRows $database $sequenceSql 1 | ForEach-Object { $_[0] }
+        if ($actions -contains 'RemoveExistingProducts' -and $actions -contains 'FindRelatedProducts') {
+            $query = 'SELECT {0}UpgradeCode{0}, {0}VersionMin{0}, {0}VersionMax{0}, {0}Language{0}, {0}Attributes{0} FROM {0}Upgrade{0}' -f $quote
+            $installed = [version]::new($Source.Version.Major, $Source.Version.Minor, $Source.Version.Build, 0)
+            foreach ($rule in (Get-MsiRows $database $query 5)) {
+                if ($rule[0] -ne $Source.UpgradeCode -or -not (Test-MsiUpgradeRange $rule $installed $Source.Language)) { continue }
+                $related = $installer.GetType().InvokeMember('RelatedProducts', 'GetProperty', $null, $installer, @($rule[0]))
+                try {
+                    $total = $related.GetType().InvokeMember('Count', 'GetProperty', $null, $related, $null)
+                    for ($index = 0; $index -lt $total; $index++) {
+                        $code = $related.GetType().InvokeMember('Item', 'GetProperty', $null, $related, @($index))
+                        if ($code -eq $Source.ProductCode) { return $properties.ProductCode }
+                    }
+                }
+                finally {
+                    [void][Runtime.InteropServices.Marshal]::ReleaseComObject($related)
+                }
+            }
+        }
+        throw "The official MSI cannot upgrade this registered package in place ($($Source.ProductCode)). Use its managed deployment."
+    }
+    finally {
+        if ($database) { [void][Runtime.InteropServices.Marshal]::ReleaseComObject($database) }
+        [void][Runtime.InteropServices.Marshal]::ReleaseComObject($installer)
+    }
+}
+
+function Get-SevenZipMaintenanceTargets {
+    param([object[]]$Registered)
+
+    $identities = @(
+        foreach ($entry in $Registered) {
+            $isMsi = $entry.WindowsInstaller -eq 1 -or
+                "$($entry.UninstallString) $($entry.QuietUninstallString)" -match '\bmsiexec(?:\.exe)?\b'
+            $directories = @(Get-SevenZipRegisteredDirectory $entry | Sort-Object -Unique)
+            $architecture = Get-SevenZipRegisteredArchitecture $entry
+            $version = ConvertTo-AppVersion $entry.DisplayVersion
+            $msi = $null
+            $issue = $null
+            if ($isMsi) {
+                try {
+                    $msi = Get-SevenZipMsiRegistration $entry
+                    $architecture = $msi.Architecture
+                    $version = $msi.Version
+                    if ($msi.Directory) { $directories = @($msi.Directory) }
+                }
+                catch { $issue = "Could not verify the original MSI. $($_.Exception.Message)" }
+            }
+            [pscustomobject]@{
+                Entry = $entry; Directories = $directories; Architecture = $architecture
+                RegisteredVersion = $version; IsMsi = $isMsi; Msi = $msi; Issue = $issue
+            }
+        }
+    )
+    $metadata = @($Registered) + @($identities | Where-Object { $_.Msi.Directory } | ForEach-Object {
+        [pscustomobject]@{ InstallLocation = $_.Msi.Directory }
+    })
+    $installations = @(Get-SevenZipInstallations $metadata | Sort-Object Directory -Unique)
+    $claimed = @{}
+    $targets = @(
+        foreach ($identity in $identities) {
+            $matches = @($installations | Where-Object { $_.Directory -in $identity.Directories })
+            if (-not $identity.Directories -and $identity.Architecture) {
+                $matches = @($installations | Where-Object { $_.Architecture -eq $identity.Architecture })
+            }
+            $directory = $null
+            $architecture = $identity.Architecture
+            $issue = $identity.Issue
+            if ($matches.Count -eq 1) {
+                $directory = $matches[0].Directory
+                if ($identity.Msi -and $identity.Architecture -ne $matches[0].Architecture) {
+                    $issue = 'The executable architecture differs from the registered MSI architecture.'
+                }
+                else { $architecture = $matches[0].Architecture }
+            }
+            elseif ($matches.Count -gt 1 -or $identity.Directories.Count -gt 1) {
+                $issue = 'The registry points to multiple possible installation directories.'
+            }
+            elseif ($identity.Directories.Count -eq 1) {
+                $directory = $identity.Directories[0]
+                $hasOriginalExe = $identity.Entry.PSChildName -eq '7-Zip' -and $identity.Entry.Publisher -eq 'Igor Pavlov'
+                if (-not $identity.IsMsi -and -not $hasOriginalExe) {
+                    $issue = 'No 7-Zip binaries remain, and the original EXE registration could not be confirmed.'
+                }
+            }
+            elseif (-not $issue) {
+                $issue = 'The original installation directory could not be determined.'
+            }
+            if (-not $architecture -and -not $issue) {
+                $issue = 'The original installation architecture could not be determined.'
+            }
+
+            if ($directory) { $claimed[$directory] = 1 + [int]$claimed[$directory] }
+            [pscustomobject]@{
+                Directory = $directory; Architecture = $architecture; RegisteredVersion = $identity.RegisteredVersion
+                Msi = $identity.Msi; Issue = $issue
+            }
+        }
+    )
+    foreach ($target in $targets) {
+        if ($target.Directory -and $claimed[$target.Directory] -gt 1) {
+            $target.Issue = "Multiple registrations claim the same directory: $($target.Directory)."
+        }
+        $target
+    }
+    foreach ($installation in $installations) {
+        if ($claimed.ContainsKey($installation.Directory)) { continue }
+        $ambiguous = $identities | Where-Object {
+            $_.IsMsi -and (-not $_.Directories -or $installation.Directory -in $_.Directories)
+        } | Select-Object -First 1
+        [pscustomobject]@{
+            Directory = $installation.Directory; Architecture = $installation.Architecture
+            RegisteredVersion = $null; Msi = $null
+            Issue = if ($ambiguous) { 'An MSI registration may own this folder. Its original deployment must be verified.' }
+        }
+    }
+}
+
 function Update-SevenZip {
     Write-StepMessage '7-Zip | Looking for installed copies in the registry and application folders.'
     $registered = @(Get-InstalledApps | Where-Object { $_.DisplayName -match '^7-Zip(?:\s|$)' })
-    $installations = @(Get-SevenZipInstallations $registered | Sort-Object File -Unique)
-    if (-not $installations -and -not $registered) {
+    $targets = @(Get-SevenZipMaintenanceTargets $registered)
+    if (-not $targets) {
         New-Result '7-Zip' 'SKIPPED' '7-Zip is not installed.' -InstalledVersion 'Not installed' -LatestStableVersion 'Not checked'
         return
     }
-
-    $msiLocations = @(
-        foreach ($entry in ($registered | Where-Object { $_.WindowsInstaller -eq 1 })) {
-            if (-not $installations) { break }
-            $directories = @(Get-SevenZipRegisteredDirectory $entry)
-            $matchesForMsi = @($installations | Where-Object {
-                if ($directories) {
-                    $directories -contains $_.Directory
-                }
-                elseif ($entry.PSPath -match 'WOW6432Node' -or $entry.DisplayName -match '\(x86\)') {
-                    $_.Architecture -eq 'x86'
-                }
-                elseif ($entry.DisplayName -match '\(arm64\)') { $_.Architecture -eq 'arm64' }
-                else {
-                    $_.Architecture -eq 'x64' -or
-                        ($_.Architecture -eq 'x86' -and -not [Environment]::Is64BitOperatingSystem)
-                }
-            })
-            if ($matchesForMsi.Count -ne 1) {
-                throw "Could not identify the installed MSI location for $($entry.DisplayName)."
-            }
-            $matchesForMsi[0].File
-        }
-    )
 
     $request = @{
         Uri = 'https://api.github.com/repos/ip7z/7zip/releases/latest'
@@ -311,54 +532,57 @@ function Update-SevenZip {
         $releaseError = $_.Exception.Message
     }
 
-    if (-not $installations) {
-        $registryVersions = @($registered | ForEach-Object { ConvertTo-AppVersion $_.DisplayVersion } | Sort-Object -Unique)
-        $installed = if ($registryVersions) { ($registryVersions -join ', ') + ' (registry only)' } else { 'Unknown' }
-        $stable = if ($latest) { $release.tag_name } else { 'Unavailable' }
-        $detail = '7-Zip is registered, but no 7z.exe, 7zFM.exe or 7zG.exe was found. Review the registered installation or repair it with its original deployment.'
-        if ($releaseError) { $detail += " Stable release lookup failed. $releaseError" }
-        New-Result '7-Zip' 'ACTION REQUIRED' $detail -InstalledVersion $installed -LatestStableVersion $stable
-        return
-    }
-
-    foreach ($installation in $installations) {
-        $name = "7-Zip ($($installation.Architecture))"
-        $versions = @{ InstalledVersion = 'Unknown'; LatestStableVersion = 'Unavailable' }
-        if ($latest) { $versions.LatestStableVersion = $release.tag_name }
+    foreach ($installation in $targets) {
+        $name = if ($installation.Architecture) { "7-Zip ($($installation.Architecture))" } else { '7-Zip' }
+        $versions = @{
+            InstalledVersion = if ($installation.RegisteredVersion) { "$($installation.RegisteredVersion) (registry only)" } else { 'Unknown' }
+            LatestStableVersion = if ($latest) { $release.tag_name } else { 'Unavailable' }
+        }
         try {
-            Write-StepMessage "$name | Reading installed executable and library versions."
-            $cli = Join-Path $installation.Directory '7z.exe'
-            $archiveLibrary = Join-Path $installation.Directory '7z.dll'
-            $files = @($installation.File)
-            if ($installation.File -ne $cli) {
-                Write-StepMessage "$name | 7z.exe is missing. Using $($installation.File) to identify this installation." 'WARNING'
-            }
-            if ($installation.File -eq $cli -or (Test-Path -LiteralPath $archiveLibrary -PathType Leaf)) {
-                $files += $archiveLibrary
-            }
-            foreach ($component in @('7zFM.exe', '7zG.exe', '7-zip.dll', '7-zip32.dll')) {
-                $file = Join-Path $installation.Directory $component
-                if ($files -notcontains $file -and (Test-Path -LiteralPath $file -PathType Leaf)) { $files += $file }
-            }
-            $before = Get-SevenZipVersion $files
-            $versions.InstalledVersion = $before
-            if ($releaseError) { throw $releaseError }
-            Write-StepMessage "$name | Oldest installed component $before. Latest stable release $($release.tag_name)."
-            if ($before -ge $latest) {
-                if ($installation.File -eq $cli) {
-                    New-Result $name 'UP TO DATE' 'All checked components meet the latest stable version.' @versions
-                }
-                else {
-                    New-Result $name 'ACTION REQUIRED' "Checked components meet the latest stable version, but 7z.exe is missing in $($installation.Directory)." @versions
-                }
-                continue
-            }
-            if ($CheckOnly) {
-                New-Result $name 'ACTION REQUIRED' 'A newer release is available. Check-only mode.' @versions
+            if ($installation.Issue) {
+                $detail = $installation.Issue
+                if ($installation.Directory) { $detail += " Folder: $($installation.Directory)." }
+                if ($releaseError) { $detail += " Stable release lookup failed. $releaseError" }
+                New-Result $name 'ACTION REQUIRED' $detail @versions
                 continue
             }
 
-            $isMsi = $msiLocations -contains $installation.File
+            Write-StepMessage "$name | Checking the installed files in $($installation.Directory)."
+            $core = @('7z.exe', '7z.dll', '7zFM.exe' | ForEach-Object { Join-Path $installation.Directory $_ })
+            $files = @($core | Where-Object { Test-Path -LiteralPath $_ -PathType Leaf })
+            $needsRepair = $files.Count -lt $core.Count
+            foreach ($component in @('7zG.exe', '7-zip.dll', '7-zip32.dll')) {
+                $file = Join-Path $installation.Directory $component
+                if (Test-Path -LiteralPath $file -PathType Leaf) { $files += $file }
+            }
+            $before = $null
+            if ($files) {
+                try { $before = Get-SevenZipVersion $files }
+                catch {
+                    $needsRepair = $true
+                    Write-StepMessage "$name | $($_.Exception.Message)" 'WARNING'
+                }
+                if ($before) { $versions.InstalledVersion = $before }
+            }
+            if ($releaseError) { throw $releaseError }
+            Write-StepMessage "$name | Installed version $($versions.InstalledVersion). Latest stable release $($release.tag_name)."
+            if (-not $needsRepair -and $before -ge $latest -and
+                (-not $installation.Msi -or $installation.Msi.Version -ge $latest)) {
+                New-Result $name 'UP TO DATE' 'All checked components meet the latest stable version.' @versions
+                continue
+            }
+            if ($before -gt $latest -or $installation.RegisteredVersion -gt $latest) {
+                New-Result $name 'ACTION REQUIRED' 'Repair deferred because this installation reports a version newer than the stable installer.' @versions
+                continue
+            }
+
+            $action = if ($needsRepair) { 'repair' } else { 'update' }
+            if ($CheckOnly) {
+                New-Result $name 'ACTION REQUIRED' "7-Zip needs a $action in $($installation.Directory). Check-only mode." @versions
+                continue
+            }
+
+            $isMsi = [bool]$installation.Msi
             $extension = if ($isMsi) { 'msi' } else { 'exe' }
             $suffix = if ($installation.Architecture -ne 'x86') { "-$($installation.Architecture)" }
             $assetName = "7z$($release.tag_name.Replace('.', ''))$suffix.$extension"
@@ -370,8 +594,11 @@ function Update-SevenZip {
             }
 
             $installer = Join-Path ([IO.Path]::GetTempPath()) ("7zip-{0}.$extension" -f [guid]::NewGuid())
+            $msiLog = $null
+            $verified = $false
+            $sourceVersion = $versions.InstalledVersion
             try {
-                Write-StepMessage "$name | Downloading $assetName."
+                Write-StepMessage "$name | Downloading $assetName for $action in $($installation.Directory)."
                 Invoke-WebRequest -Uri $url -UseBasicParsing -OutFile $installer -TimeoutSec 120
                 Write-StepMessage "$name | Verifying the SHA-256 hash and checking the installer signature."
                 if ((Get-FileHash -LiteralPath $installer -Algorithm SHA256).Hash -ne $asset.digest.Substring(7)) {
@@ -384,39 +611,64 @@ function Update-SevenZip {
                     throw "Invalid installer signature: $($signature.Status)."
                 }
 
-                Write-StepMessage "$name | Installing silently. Waiting for the installer to finish."
+                $targetCode = $null
                 if ($isMsi) {
-                    $arguments = '/i "{0}" /qn /norestart INSTALLDIR="{1}"' -f $installer, $installation.Directory
+                    Write-StepMessage "$name | Verifying that the official MSI can replace the registered package."
+                    $targetCode = Get-SevenZipMsiTargetCode $installer $installation.Msi $latest
+                    $msiLog = "$installer.log"
+                    $arguments = '/i "{0}" /qn /norestart INSTALLDIR="{1}" /L*v "{2}"' -f $installer, $installation.Directory, $msiLog
+                    if ($targetCode -eq $installation.Msi.ProductCode) { $arguments += ' REINSTALL=ALL REINSTALLMODE=vomus' }
+                    Write-StepMessage "$name | Running silent MSI $action in the original installation folder."
                     $process = Start-Process -FilePath "$env:SystemRoot\System32\msiexec.exe" -ArgumentList $arguments -Wait -PassThru
                 }
                 else {
+                    Write-StepMessage "$name | Running silent EXE $action in the original installation folder."
                     $arguments = '/S /D="{0}"' -f $installation.Directory
                     $process = Start-Process -FilePath $installer -ArgumentList $arguments -Wait -PassThru
                 }
 
-                if ($process.ExitCode -eq 3010) {
-                    New-Result $name 'PENDING' 'The installer requests a restart (3010). Installed version is the last verified value.' @versions -Restart
+                if ($process.ExitCode -in @(1641, 3010)) {
+                    New-Result $name 'PENDING' "The installer requests a restart ($($process.ExitCode))." @versions -Restart
                     continue
                 }
                 if ($process.ExitCode -ne 0) {
                     throw "Installer exit code: $($process.ExitCode)."
                 }
 
-                Write-StepMessage "$name | Installer exited with code 0. Checking the installed versions again."
-                $files = @(($files + @($cli, $archiveLibrary)) | Sort-Object -Unique)
-                $after = Get-SevenZipVersion $files
+                Write-StepMessage "$name | Installer exited with code 0. Verifying the files in the original folder."
+                $files = @(($files + $core) | Sort-Object -Unique)
+                try { $after = Get-SevenZipVersion $files }
+                catch {
+                    if (Test-PendingFileReplacement $files) {
+                        New-Result $name 'PENDING' 'Restart to replace files in use.' @versions -Restart
+                        continue
+                    }
+                    throw
+                }
                 $versions.InstalledVersion = $after
                 if ($after -lt $latest) {
                     if (Test-PendingFileReplacement $files) {
                         New-Result $name 'PENDING' 'Restart to replace files in use.' @versions -Restart
                         continue
                     }
-                    throw "After installation: $after | Expected: $latest or newer | $($installation.File)"
+                    throw "After installation: $after | Expected: $latest or newer | $($installation.Directory)"
                 }
-                New-Result $name 'UPDATED' "Verified update from $before to $after." @versions -PreviousVersion $before
+                if ($isMsi -and ((Get-MsiProductState $targetCode) -ne 5 -or
+                    ($targetCode -ne $installation.Msi.ProductCode -and (Get-MsiProductState $installation.Msi.ProductCode) -ne -1))) {
+                    throw 'Could not verify that Windows Installer replaced the old 7-Zip MSI.'
+                }
+                $verified = $true
+                New-Result $name 'UPDATED' "Verified $action in $($installation.Directory)." @versions -PreviousVersion $sourceVersion
+            }
+            catch {
+                if ($msiLog -and (Test-Path -LiteralPath $msiLog -PathType Leaf)) {
+                    throw "$($_.Exception.Message) Installer log: $msiLog"
+                }
+                throw
             }
             finally {
                 Remove-Item -LiteralPath $installer -Force -ErrorAction SilentlyContinue
+                if ($verified -and $msiLog) { Remove-Item -LiteralPath $msiLog -Force -ErrorAction SilentlyContinue }
             }
         }
         catch {
@@ -728,7 +980,7 @@ function Test-MsiUpgradeRange {
     return $true
 }
 
-function Get-TeamViewerMsiProductState {
+function Get-MsiProductState {
     param([string]$ProductCode)
 
     $installer = New-Object -ComObject WindowsInstaller.Installer
@@ -834,7 +1086,7 @@ function Update-TeamViewerMsi {
             New-Result $App.Name 'ACTION REQUIRED' 'The registered TeamViewer MSI product code could not be read.' @versions
             return
         }
-        $msiState = Get-TeamViewerMsiProductState $App.ProductCode
+        $msiState = Get-MsiProductState $App.ProductCode
         if ($msiState -ne 5) {
             try { $versions.LatestStableVersion = Get-LatestTeamViewerVersion $App.PackageId }
             catch { Write-StepMessage "$($App.Name) | Latest stable version lookup failed. $($_.Exception.Message)" 'WARNING' }
@@ -916,8 +1168,8 @@ function Update-TeamViewerMsi {
             $after = Get-TeamViewerVersion $installedApp
             if ($after) { $versions.InstalledVersion = $after }
             if (-not $after -or $after -lt $package.Version -or
-                (Get-TeamViewerMsiProductState $package.ProductCode) -ne 5 -or
-                ($App.ProductCode -ne $package.ProductCode -and (Get-TeamViewerMsiProductState $App.ProductCode) -ne -1)) {
+                (Get-MsiProductState $package.ProductCode) -ne 5 -or
+                ($App.ProductCode -ne $package.ProductCode -and (Get-MsiProductState $App.ProductCode) -ne -1)) {
                 throw "MSI returned success, but the new version and replacement of the old MSI could not be verified."
             }
             New-Result $App.Name 'UPDATED' "Verified TeamViewer MSI update ($architecture)." @versions -PreviousVersion $before
