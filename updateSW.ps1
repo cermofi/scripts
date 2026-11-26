@@ -169,6 +169,20 @@ function Get-PeArchitecture {
     }
 }
 
+function Get-SevenZipRegisteredDirectory {
+    param($App)
+
+    $directory = [Environment]::ExpandEnvironmentVariables(([string]$App.InstallLocation).Trim().Trim('"')).TrimEnd('\')
+    if ($directory -match '^[a-z]:\\') { $directory }
+
+    foreach ($value in @($App.DisplayIcon, $App.QuietUninstallString, $App.UninstallString)) {
+        $command = [Environment]::ExpandEnvironmentVariables([string]$value)
+        if ($command -match '^\s*"?(?<Folder>[a-z]:\\[^"<>:|?*\r\n]*?)\\(?:7z(?:FM|G)?|Uninstall)\.exe(?=["\s,]|$)') {
+            $Matches.Folder
+        }
+    }
+}
+
 function Get-SevenZipInstallations {
     param([object[]]$Registered)
 
@@ -178,7 +192,7 @@ function Get-SevenZipInstallations {
             if ($base) { Join-Path $base '7-Zip' }
         }
         foreach ($app in $Registered) {
-            if ($app.InstallLocation) { $app.InstallLocation }
+            Get-SevenZipRegisteredDirectory $app
         }
         foreach ($key in @('HKLM:\SOFTWARE\7-Zip', 'HKLM:\SOFTWARE\WOW6432Node\7-Zip')) {
             if (Test-Path -LiteralPath $key) {
@@ -188,17 +202,31 @@ function Get-SevenZipInstallations {
                 $entry.Path32
             }
         }
+        foreach ($root in @('HKLM:\SOFTWARE', 'HKLM:\SOFTWARE\WOW6432Node')) {
+            $key = "$root\Microsoft\Windows\CurrentVersion\App Paths\7zFM.exe"
+            if (Test-Path -LiteralPath $key) {
+                $entry = Get-ItemProperty -LiteralPath $key
+                $entry.Path
+                Get-SevenZipRegisteredDirectory ([pscustomobject]@{ DisplayIcon = $entry.'(default)' })
+            }
+        }
     )
 
-    foreach ($directory in ($directories | Where-Object { $_ } | Sort-Object -Unique)) {
-        $file = Join-Path $directory '7z.exe'
-        if (Test-Path -LiteralPath $file -PathType Leaf) {
+    $uniqueDirectories = $directories | Where-Object { $_ } | ForEach-Object {
+        [Environment]::ExpandEnvironmentVariables(([string]$_).Trim().Trim('"')).TrimEnd('\')
+    } | Where-Object { $_ -match '^[a-z]:\\' } | Sort-Object -Unique
+    foreach ($directory in $uniqueDirectories) {
+        foreach ($component in @('7z.exe', '7zFM.exe', '7zG.exe')) {
+            $file = Join-Path $directory $component
+            if (-not (Test-Path -LiteralPath $file -PathType Leaf)) { continue }
             $item = Get-Item -LiteralPath $file
+            $architecture = Get-PeArchitecture $item.FullName
             [pscustomobject]@{
                 File         = $item.FullName
                 Directory    = $item.DirectoryName
-                Architecture = Get-PeArchitecture $item.FullName
+                Architecture = $architecture
             }
+            break
         }
     }
 }
@@ -232,21 +260,23 @@ function Update-SevenZip {
     Write-StepMessage '7-Zip | Looking for installed copies in the registry and application folders.'
     $registered = @(Get-InstalledApps | Where-Object { $_.DisplayName -match '^7-Zip(?:\s|$)' })
     $installations = @(Get-SevenZipInstallations $registered | Sort-Object File -Unique)
-    if (-not $installations) {
-        if ($registered) { throw '7-Zip is registered, but 7z.exe could not be found.' }
+    if (-not $installations -and -not $registered) {
         New-Result '7-Zip' 'SKIPPED' '7-Zip is not installed.' -InstalledVersion 'Not installed' -LatestStableVersion 'Not checked'
         return
     }
 
     $msiLocations = @(
         foreach ($entry in ($registered | Where-Object { $_.WindowsInstaller -eq 1 })) {
+            if (-not $installations) { break }
+            $directories = @(Get-SevenZipRegisteredDirectory $entry)
             $matchesForMsi = @($installations | Where-Object {
-                if ($entry.InstallLocation) {
-                    $_.Directory -eq $entry.InstallLocation.TrimEnd('\')
+                if ($directories) {
+                    $directories -contains $_.Directory
                 }
                 elseif ($entry.PSPath -match 'WOW6432Node' -or $entry.DisplayName -match '\(x86\)') {
                     $_.Architecture -eq 'x86'
                 }
+                elseif ($entry.DisplayName -match '\(arm64\)') { $_.Architecture -eq 'arm64' }
                 else {
                     $_.Architecture -eq 'x64' -or
                         ($_.Architecture -eq 'x86' -and -not [Environment]::Is64BitOperatingSystem)
@@ -281,23 +311,46 @@ function Update-SevenZip {
         $releaseError = $_.Exception.Message
     }
 
+    if (-not $installations) {
+        $registryVersions = @($registered | ForEach-Object { ConvertTo-AppVersion $_.DisplayVersion } | Sort-Object -Unique)
+        $installed = if ($registryVersions) { ($registryVersions -join ', ') + ' (registry only)' } else { 'Unknown' }
+        $stable = if ($latest) { $release.tag_name } else { 'Unavailable' }
+        $detail = '7-Zip is registered, but no 7z.exe, 7zFM.exe or 7zG.exe was found. Review the registered installation or repair it with its original deployment.'
+        if ($releaseError) { $detail += " Stable release lookup failed. $releaseError" }
+        New-Result '7-Zip' 'ACTION REQUIRED' $detail -InstalledVersion $installed -LatestStableVersion $stable
+        return
+    }
+
     foreach ($installation in $installations) {
         $name = "7-Zip ($($installation.Architecture))"
         $versions = @{ InstalledVersion = 'Unknown'; LatestStableVersion = 'Unavailable' }
         if ($latest) { $versions.LatestStableVersion = $release.tag_name }
         try {
             Write-StepMessage "$name | Reading installed executable and library versions."
-            $files = @($installation.File, (Join-Path $installation.Directory '7z.dll'))
+            $cli = Join-Path $installation.Directory '7z.exe'
+            $archiveLibrary = Join-Path $installation.Directory '7z.dll'
+            $files = @($installation.File)
+            if ($installation.File -ne $cli) {
+                Write-StepMessage "$name | 7z.exe is missing. Using $($installation.File) to identify this installation." 'WARNING'
+            }
+            if ($installation.File -eq $cli -or (Test-Path -LiteralPath $archiveLibrary -PathType Leaf)) {
+                $files += $archiveLibrary
+            }
             foreach ($component in @('7zFM.exe', '7zG.exe', '7-zip.dll', '7-zip32.dll')) {
                 $file = Join-Path $installation.Directory $component
-                if (Test-Path -LiteralPath $file -PathType Leaf) { $files += $file }
+                if ($files -notcontains $file -and (Test-Path -LiteralPath $file -PathType Leaf)) { $files += $file }
             }
             $before = Get-SevenZipVersion $files
             $versions.InstalledVersion = $before
             if ($releaseError) { throw $releaseError }
             Write-StepMessage "$name | Oldest installed component $before. Latest stable release $($release.tag_name)."
             if ($before -ge $latest) {
-                New-Result $name 'UP TO DATE' 'All checked components meet the latest stable version.' @versions
+                if ($installation.File -eq $cli) {
+                    New-Result $name 'UP TO DATE' 'All checked components meet the latest stable version.' @versions
+                }
+                else {
+                    New-Result $name 'ACTION REQUIRED' "Checked components meet the latest stable version, but 7z.exe is missing in $($installation.Directory)." @versions
+                }
                 continue
             }
             if ($CheckOnly) {
@@ -350,6 +403,7 @@ function Update-SevenZip {
                 }
 
                 Write-StepMessage "$name | Installer exited with code 0. Checking the installed versions again."
+                $files = @(($files + @($cli, $archiveLibrary)) | Sort-Object -Unique)
                 $after = Get-SevenZipVersion $files
                 $versions.InstalledVersion = $after
                 if ($after -lt $latest) {
@@ -674,6 +728,18 @@ function Test-MsiUpgradeRange {
     return $true
 }
 
+function Get-TeamViewerMsiProductState {
+    param([string]$ProductCode)
+
+    $installer = New-Object -ComObject WindowsInstaller.Installer
+    try {
+        [int]$installer.GetType().InvokeMember('ProductState', 'GetProperty', $null, $installer, @($ProductCode))
+    }
+    finally {
+        [void][Runtime.InteropServices.Marshal]::ReleaseComObject($installer)
+    }
+}
+
 function Get-TeamViewerMsiUpgrade {
     param([string]$Path, $App, [version]$Latest)
 
@@ -706,13 +772,20 @@ function Get-TeamViewerMsiUpgrade {
             throw "Unexpected TeamViewer MSI: $($properties.ProductName), version $($properties.ProductVersion)."
         }
 
-        $registryVersion = $installer.GetType().InvokeMember(
-            'ProductInfo', 'GetProperty', $null, $installer, @($App.ProductCode, 'VersionString'))
+        $state = $installer.GetType().InvokeMember('ProductState', 'GetProperty', $null, $installer, @($App.ProductCode))
+        if ($state -ne 5) { throw "The source TeamViewer MSI $($App.ProductCode) is no longer installed (state $state). Recheck the inventory." }
+        try {
+            $registryVersion = $installer.GetType().InvokeMember(
+                'ProductInfo', 'GetProperty', $null, $installer, @($App.ProductCode, 'VersionString'))
+            $language = $installer.GetType().InvokeMember(
+                'ProductInfo', 'GetProperty', $null, $installer, @($App.ProductCode, 'Language'))
+        }
+        catch {
+            throw "Could not read Windows Installer version or language for $($App.ProductCode). $($_.Exception.Message)"
+        }
         $installed = ConvertTo-AppVersion $registryVersion
         if (-not $installed) { throw 'Could not read the installed TeamViewer MSI product version.' }
         $installed = [version]::new($installed.Major, $installed.Minor, $installed.Build, 0)
-        $language = $installer.GetType().InvokeMember(
-            'ProductInfo', 'GetProperty', $null, $installer, @($App.ProductCode, 'Language'))
 
         $sequenceQuery = 'SELECT {0}Action{0} FROM {0}InstallExecuteSequence{0}' -f $quote
         $actions = Get-MsiRows $database $sequenceQuery 1 | ForEach-Object { $_[0] }
@@ -752,7 +825,29 @@ function Update-TeamViewerMsi {
     try {
         Write-StepMessage "$($App.Name) | Reading the installed MSI version."
         $before = Get-TeamViewerVersion @($App)
+        $registeredVersion = ConvertTo-AppVersion $App.VersionText
+        if ($registeredVersion -and (-not $before -or $registeredVersion -lt $before)) {
+            $before = $registeredVersion
+        }
         if ($before) { $versions.InstalledVersion = $before }
+        if (-not $App.ProductCode) {
+            New-Result $App.Name 'ACTION REQUIRED' 'The registered TeamViewer MSI product code could not be read.' @versions
+            return
+        }
+        $msiState = Get-TeamViewerMsiProductState $App.ProductCode
+        if ($msiState -ne 5) {
+            try { $versions.LatestStableVersion = Get-LatestTeamViewerVersion $App.PackageId }
+            catch { Write-StepMessage "$($App.Name) | Latest stable version lookup failed. $($_.Exception.Message)" 'WARNING' }
+            if ($registeredVersion) { $versions.InstalledVersion = "$registeredVersion (registry only)" }
+            $detail = if ($msiState -eq -1) {
+                "Windows Installer no longer recognizes product $($App.ProductCode). Review the leftover uninstall registry entry."
+            }
+            else {
+                "Windows Installer reports state $msiState for product $($App.ProductCode). Review it in your managed deployment."
+            }
+            New-Result $App.Name 'ACTION REQUIRED' $detail @versions
+            return
+        }
         $latest = Get-LatestTeamViewerVersion $App.PackageId
         $versions.LatestStableVersion = $latest
         Write-StepMessage "$($App.Name) | Installed version $($versions.InstalledVersion). Latest stable version $latest."
@@ -821,7 +916,8 @@ function Update-TeamViewerMsi {
             $after = Get-TeamViewerVersion $installedApp
             if ($after) { $versions.InstalledVersion = $after }
             if (-not $after -or $after -lt $package.Version -or
-                ($App.ProductCode -ne $package.ProductCode -and $afterInventory.ProductCode -contains $App.ProductCode)) {
+                (Get-TeamViewerMsiProductState $package.ProductCode) -ne 5 -or
+                ($App.ProductCode -ne $package.ProductCode -and (Get-TeamViewerMsiProductState $App.ProductCode) -ne -1)) {
                 throw "MSI returned success, but the new version and replacement of the old MSI could not be verified."
             }
             New-Result $App.Name 'UPDATED' "Verified TeamViewer MSI update ($architecture)." @versions -PreviousVersion $before
@@ -881,16 +977,41 @@ function Update-TeamViewer {
         return
     }
 
-    $manual = @($inventory | Where-Object { $_.IsMsi -or $_.Scope -ne 'Machine registry' -or -not $_.PackageId })
-    foreach ($app in $manual) {
+    $msiTargets = @($inventory | Where-Object { $_.IsMsi -and $_.Scope -eq 'Machine registry' -and $_.PackageId })
+    $seenMsi = @{}
+    $msiRestartPending = $false
+    foreach ($target in $msiTargets) {
+        $app = $target
         try {
-            if ($app.IsMsi -and $app.Scope -eq 'Machine registry' -and $app.PackageId) {
-                Update-TeamViewerMsi $app
+            if ($target.ProductCode) {
+                if ($seenMsi.ContainsKey($target.ProductCode)) { continue }
+                $seenMsi[$target.ProductCode] = $true
+                $app = $inventory | Where-Object {
+                    $_.IsMsi -and $_.Scope -eq 'Machine registry' -and $_.ProductCode -eq $target.ProductCode
+                } | Select-Object -First 1
+                if (-not $app) {
+                    Write-StepMessage "$($target.Name) | Product $($target.ProductCode) disappeared from the live inventory after the previous MSI operation."
+                    continue
+                }
             }
-            else {
-                Write-TeamViewerDetectedResult $app
+            if ($msiRestartPending) {
+                $detected = Get-TeamViewerVersion @($app)
+                New-Result $app.Name 'PENDING' 'MSI update deferred until after the restart requested by the previous TeamViewer update.' -InstalledVersion $detected -LatestStableVersion 'Not checked'
+                continue
             }
+            $result = Update-TeamViewerMsi $app
+            $result
+            $msiRestartPending = $result.Restart
+            if ($result.Status -in @('UPDATED', 'FAILED', 'PENDING')) { $inventory = @(Get-TeamViewerInventory) }
         }
+        catch {
+            New-Result $target.Name 'FAILED' $_.Exception.Message -InstalledVersion 'Unknown' -LatestStableVersion 'Not checked'
+        }
+    }
+
+    $manual = @($inventory | Where-Object { $_.IsMsi -or $_.Scope -ne 'Machine registry' -or -not $_.PackageId })
+    foreach ($app in ($manual | Where-Object { -not ($_.IsMsi -and $_.Scope -eq 'Machine registry' -and $_.PackageId) })) {
+        try { Write-TeamViewerDetectedResult $app }
         catch {
             New-Result $app.Name 'FAILED' $_.Exception.Message -InstalledVersion 'Unknown' -LatestStableVersion 'Not checked'
         }
